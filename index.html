@@ -5,22 +5,646 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Paper Toss AI</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <style>
-      body { margin: 0; overflow: hidden; background-color: #1a1a1a; }
+      body { margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: system-ui, -apple-system, sans-serif; }
       canvas { touch-action: none; }
+      #error-display { color: #ff9999; padding: 20px; position: fixed; top: 0; left: 0; right:0; bottom:0; z-index: 9999; background: rgba(0,0,0,0.9); display: none; overflow: auto; font-family: monospace; white-space: pre-wrap; }
     </style>
-  <script type="importmap">
+    <script>
+      // CRITICAL: Polyfill process.env before any module loads
+      window.process = window.process || { env: { API_KEY: '' } };
+    </script>
+    <script type="importmap">
 {
   "imports": {
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "react": "https://aistudiocdn.com/react@^19.2.0",
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/"
+    "react": "https://esm.sh/react@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+    "@google/genai": "https://esm.sh/@google/genai@0.1.2",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/"
   }
 }
 </script>
-</head>
+  </head>
   <body>
     <div id="root"></div>
+    <div id="error-display"></div>
+
+    <script type="text/babel" data-type="module" data-presets="react,typescript">
+      import React, { useState, useRef, useEffect, useCallback } from 'react';
+      import { createRoot } from 'react-dom/client';
+      import { GoogleGenAI } from '@google/genai';
+
+      // --- Error Handling ---
+      window.onerror = function(message, source, lineno, colno, error) {
+        const el = document.getElementById('error-display');
+        if (el) {
+          el.style.display = 'block';
+          el.innerText = `Runtime Error:\n${message}\n\nLocation: ${source}:${lineno}:${colno}\n\nStack:\n${error?.stack || 'No stack trace'}`;
+        }
+      };
+      
+      window.addEventListener('unhandledrejection', function(event) {
+        const el = document.getElementById('error-display');
+        if (el) {
+          el.style.display = 'block';
+          el.innerText = `Unhandled Promise Rejection:\n${event.reason}`;
+        }
+      });
+
+      // --- Services & Constants ---
+      
+      const apiKey = process.env.API_KEY || '';
+      let ai;
+      try {
+        // Initialize GenAI safely. 
+        // Note: In this environment, we expect the key to be injected via process.env.API_KEY
+        ai = new GoogleGenAI({ apiKey: apiKey });
+      } catch (e) {
+        console.warn("GenAI init warning (might be missing key):", e);
+      }
+
+      // -- Types (Simplified for Babel Standalone) --
+      const GameState = {
+        IDLE: 'IDLE',
+        DRAGGING: 'DRAGGING',
+        THROWN: 'THROWN',
+        LANDED: 'LANDED',
+        MISSED: 'MISSED'
+      };
+
+      // -- Service Functions --
+      const sendChatMessage = async (history, newMessage) => {
+        if (!ai) return "AI not initialized (Missing API Key).";
+        try {
+          const chat = ai.chats.create({
+            model: 'gemini-3-pro-preview',
+            config: {
+              systemInstruction: "You are a helpful and witty assistant inside a 'Paper Toss' game. Keep your responses concise, encouraging, or playfully snarky about the user's throwing skills.",
+            },
+            history: history.map(msg => ({
+              role: msg.role,
+              parts: [{ text: msg.text }],
+            })),
+          });
+
+          const result = await chat.sendMessage({ message: newMessage });
+          return result.text || "I'm speechless!";
+        } catch (error) {
+          console.error("Chat Error:", error);
+          return "Oops, my brain circuit tripped. Try again?";
+        }
+      };
+
+      const generateGameBackground = async (prompt, size) => {
+        if (!ai) throw new Error("AI not initialized");
+        try {
+          const response = await ai.models.generateContent({
+            model: 'gemini-3-pro-image-preview',
+            contents: {
+              parts: [
+                {
+                  text: `A realistic, high-quality background scene for a paper toss game. The view is from a desk looking outwards. ${prompt}. Ensure the center area is relatively clear for a trash bin.`,
+                },
+              ],
+            },
+            config: {
+              imageConfig: {
+                aspectRatio: "16:9",
+                imageSize: size,
+              },
+            },
+          });
+
+          // Correctly extract image from response
+          for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) {
+              return `data:image/png;base64,${part.inlineData.data}`;
+            }
+          }
+          return null;
+        } catch (error) {
+          console.error("Image Gen Error:", error);
+          throw error;
+        }
+      };
+
+      // --- Components ---
+
+      // 1. GameCanvas
+      const GRAVITY = 0.5;
+      const AIR_RESISTANCE = 0.98;
+      const WIND_FACTOR = 0.05;
+      const THROW_SCALE = 0.15;
+      const PERSPECTIVE = 800;
+      const BIN_Z = 600;
+      const BIN_RADIUS = 60;
+      const BALL_RADIUS = 15;
+
+      const GameCanvas = ({ wind, onScoreUpdate, backgroundUrl }) => {
+        const canvasRef = useRef(null);
+        const [gameState, setGameState] = useState(GameState.IDLE);
+        const [localScore, setLocalScore] = useState(0);
+
+        const physicsState = useRef({
+          ball: { x: 0, y: 0, z: 0 },
+          velocity: { x: 0, y: 0, z: 0 },
+          dragStart: { x: 0, y: 0 },
+          dragCurrent: { x: 0, y: 0 },
+        });
+
+        const resetBall = useCallback((width, height) => {
+          physicsState.current.ball = { x: 0, y: height / 2 - 100, z: 0 };
+          physicsState.current.velocity = { x: 0, y: 0, z: 0 };
+          setGameState(GameState.IDLE);
+        }, []);
+
+        const handlePointerDown = (e) => {
+          if (gameState !== GameState.IDLE) return;
+          setGameState(GameState.DRAGGING);
+          physicsState.current.dragStart = { x: e.clientX, y: e.clientY };
+          physicsState.current.dragCurrent = { x: e.clientX, y: e.clientY };
+        };
+
+        const handlePointerMove = (e) => {
+          if (gameState === GameState.DRAGGING) {
+            physicsState.current.dragCurrent = { x: e.clientX, y: e.clientY };
+          }
+        };
+
+        const handlePointerUp = (e) => {
+          if (gameState !== GameState.DRAGGING) return;
+          
+          const dx = physicsState.current.dragCurrent.x - physicsState.current.dragStart.x;
+          const dy = physicsState.current.dragCurrent.y - physicsState.current.dragStart.y;
+          const throwPowerY = Math.min(dy, 0);
+          
+          if (Math.abs(throwPowerY) < 50) {
+              setGameState(GameState.IDLE);
+              return;
+          }
+
+          const vz = Math.abs(throwPowerY) * THROW_SCALE * 1.5;
+          const vy = throwPowerY * THROW_SCALE * 0.8;
+          const vx = dx * THROW_SCALE * 0.5;
+
+          physicsState.current.velocity = { x: vx, y: vy, z: vz };
+          setGameState(GameState.THROWN);
+        };
+
+        useEffect(() => {
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return;
+
+          let animationFrameId;
+
+          const render = () => {
+            if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
+              canvas.width = window.innerWidth;
+              canvas.height = window.innerHeight;
+              if (gameState === GameState.IDLE) {
+                 resetBall(canvas.width, canvas.height);
+              }
+            }
+
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2 + 100;
+
+            if (gameState === GameState.THROWN) {
+              const { ball, velocity } = physicsState.current;
+              velocity.y += GRAVITY;
+              velocity.x += wind.speed * WIND_FACTOR;
+              velocity.x *= AIR_RESISTANCE;
+              velocity.z *= AIR_RESISTANCE;
+              ball.x += velocity.x;
+              ball.y += velocity.y;
+              ball.z += velocity.z;
+
+              const floorY = 300;
+              if (ball.z >= BIN_Z && ball.z <= BIN_Z + 50) {
+                 const binRimY = 150; 
+                 if (Math.abs(ball.y - binRimY) < 50) {
+                     if (Math.abs(ball.x) < BIN_RADIUS) {
+                         setGameState(GameState.LANDED);
+                         setLocalScore(s => {
+                             const newScore = s + 1;
+                             onScoreUpdate(newScore);
+                             return newScore;
+                         });
+                         setTimeout(() => resetBall(canvas.width, canvas.height), 1000);
+                     }
+                 }
+              }
+              if (ball.y > floorY + 200 || ball.z > BIN_Z + 200) {
+                  setGameState(GameState.MISSED);
+                  setTimeout(() => resetBall(canvas.width, canvas.height), 1000);
+              }
+            } else if (gameState === GameState.IDLE || gameState === GameState.DRAGGING) {
+                physicsState.current.ball = { x: 0, y: 300, z: 0 };
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (backgroundUrl) {
+                const bgImg = document.getElementById('bg-image-source');
+                if (bgImg && bgImg.complete && bgImg.naturalWidth > 0) {
+                    ctx.drawImage(bgImg, 0, 0, canvas.width, canvas.height);
+                } else {
+                    // Fallback if image not ready
+                    ctx.fillStyle = '#333';
+                    ctx.fillRect(0,0, canvas.width, canvas.height);
+                }
+            } else {
+              ctx.fillStyle = '#f0f0f0';
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.fillStyle = '#e0e0e0';
+              ctx.beginPath();
+              ctx.moveTo(0, centerY);
+              ctx.lineTo(canvas.width, centerY);
+              ctx.lineTo(canvas.width, canvas.height);
+              ctx.lineTo(0, canvas.height);
+              ctx.fill();
+            }
+
+            const project = (p) => {
+              const scale = PERSPECTIVE / (PERSPECTIVE + p.z);
+              return {
+                x: centerX + p.x * scale,
+                y: centerY + p.y * scale,
+                scale: scale
+              };
+            };
+
+            const binPos = { x: 0, y: 150, z: BIN_Z };
+            const projBin = project(binPos);
+            const binScale = projBin.scale;
+            const scaledBinRadius = BIN_RADIUS * binScale;
+
+            ctx.fillStyle = '#555';
+            ctx.beginPath();
+            ctx.ellipse(projBin.x, projBin.y, scaledBinRadius, scaledBinRadius * 0.3, 0, 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.fillStyle = '#777';
+            ctx.beginPath();
+            ctx.moveTo(projBin.x - scaledBinRadius, projBin.y);
+            ctx.lineTo(projBin.x - scaledBinRadius * 0.8, projBin.y + 100 * binScale);
+            ctx.lineTo(projBin.x + scaledBinRadius * 0.8, projBin.y + 100 * binScale);
+            ctx.lineTo(projBin.x + scaledBinRadius, projBin.y);
+            ctx.fill();
+
+            const { ball } = physicsState.current;
+            const projBall = project(ball);
+            const scaledBallRadius = BALL_RADIUS * projBall.scale;
+
+            ctx.fillStyle = 'rgba(0,0,0,0.2)';
+            ctx.beginPath();
+            ctx.ellipse(projBall.x, centerY + (150 + 100*binScale) * projBall.scale, scaledBallRadius, scaledBallRadius * 0.3, 0, 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(projBall.x, projBall.y, scaledBallRadius, 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.strokeStyle = '#ccc';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(projBall.x - scaledBallRadius*0.5, projBall.y);
+            ctx.lineTo(projBall.x + scaledBallRadius*0.5, projBall.y);
+            ctx.stroke();
+
+            ctx.strokeStyle = '#444';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.ellipse(projBin.x, projBin.y, scaledBinRadius, scaledBinRadius * 0.3, 0, 0, Math.PI);
+            ctx.stroke();
+
+            if (gameState === GameState.DRAGGING) {
+                ctx.beginPath();
+                ctx.moveTo(physicsState.current.dragStart.x, physicsState.current.dragStart.y);
+                ctx.lineTo(physicsState.current.dragCurrent.x, physicsState.current.dragCurrent.y);
+                ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+                ctx.lineWidth = 5;
+                ctx.stroke();
+            }
+
+            animationFrameId = requestAnimationFrame(render);
+          };
+
+          render();
+          return () => cancelAnimationFrame(animationFrameId);
+        }, [gameState, wind, backgroundUrl, onScoreUpdate, resetBall]);
+
+        return (
+          <div className="relative w-full h-full touch-none">
+             {backgroundUrl && (
+                 <img 
+                   id="bg-image-source" 
+                   src={backgroundUrl} 
+                   alt="bg" 
+                   className="hidden" 
+                 />
+             )}
+            <canvas
+              ref={canvasRef}
+              className="block w-full h-full cursor-grab active:cursor-grabbing"
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+              onPointerLeave={handlePointerUp}
+            />
+            
+            <div className="absolute top-4 left-4 text-white drop-shadow-md pointer-events-none select-none">
+                <h1 className="text-4xl font-bold">Score: {localScore}</h1>
+            </div>
+
+             <div className="absolute top-20 left-4 bg-black/30 backdrop-blur-md p-3 rounded-lg text-white pointer-events-none select-none">
+                <div className="flex items-center gap-2">
+                   <span className="font-semibold">Wind:</span>
+                   <span className="text-xl font-bold">{Math.abs(wind.speed).toFixed(1)}</span>
+                   <div 
+                     className="transform transition-transform duration-500"
+                     style={{ transform: `rotate(${wind.speed > 0 ? 0 : 180}deg)` }}
+                   >
+                     ➔
+                   </div>
+                </div>
+             </div>
+
+            {gameState === GameState.IDLE && (
+                <div className="absolute bottom-20 left-1/2 -translate-x-1/2 text-white/80 animate-bounce pointer-events-none select-none">
+                    Swipe up to toss!
+                </div>
+            )}
+          </div>
+        );
+      };
+
+      // 2. ChatInterface
+      const ChatInterface = ({ isOpen, onClose }) => {
+        const [messages, setMessages] = useState([
+          { role: 'model', text: 'Hey there! Nice throw... or was it? Ask me anything or just chat while you play!', timestamp: new Date() }
+        ]);
+        const [input, setInput] = useState('');
+        const [isLoading, setIsLoading] = useState(false);
+        const messagesEndRef = useRef(null);
+
+        const scrollToBottom = () => {
+          messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        };
+
+        useEffect(scrollToBottom, [messages]);
+
+        const handleSend = async () => {
+          if (!input.trim() || isLoading) return;
+
+          const userMsg = { role: 'user', text: input, timestamp: new Date() };
+          setMessages(prev => [...prev, userMsg]);
+          setInput('');
+          setIsLoading(true);
+
+          try {
+            const responseText = await sendChatMessage(messages, input);
+            setMessages(prev => [...prev, { role: 'model', text: responseText, timestamp: new Date() }]);
+          } catch (e) {
+            console.error(e);
+          } finally {
+            setIsLoading(false);
+          }
+        };
+
+        if (!isOpen) return null;
+
+        return (
+          <div className="absolute right-0 top-0 h-full w-full md:w-96 bg-gray-900/95 backdrop-blur-xl border-l border-gray-700 shadow-2xl flex flex-col transition-all duration-300 z-50">
+            <div className="p-4 border-b border-gray-700 flex justify-between items-center bg-gray-800/50">
+              <h2 className="text-white font-bold text-lg flex items-center gap-2">
+                <span>🤖</span> Game Assistant
+              </h2>
+              <button onClick={onClose} className="text-gray-400 hover:text-white p-2">
+                ✕
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {messages.map((msg, idx) => (
+                <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[80%] rounded-2xl p-3 text-sm ${
+                    msg.role === 'user' 
+                      ? 'bg-blue-600 text-white rounded-br-none' 
+                      : 'bg-gray-700 text-gray-100 rounded-bl-none'
+                  }`}>
+                    {msg.text}
+                  </div>
+                </div>
+              ))}
+              {isLoading && (
+                <div className="flex justify-start">
+                   <div className="bg-gray-700 text-gray-100 rounded-2xl p-3 rounded-bl-none animate-pulse">
+                     Thinking...
+                   </div>
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            <div className="p-4 border-t border-gray-700 bg-gray-800/50">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+                  placeholder="Ask about your throw..."
+                  className="flex-1 bg-gray-950 border border-gray-600 rounded-full px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+                />
+                <button 
+                  onClick={handleSend}
+                  disabled={isLoading || !input.trim()}
+                  className="bg-blue-600 hover:bg-blue-500 text-white p-2 rounded-full disabled:opacity-50 transition-colors w-10 h-10 flex items-center justify-center"
+                >
+                  ➤
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      // 3. BackgroundGenerator
+      const BackgroundGenerator = ({ isOpen, onClose, onBackgroundGenerated }) => {
+        const [prompt, setPrompt] = useState('');
+        const [size, setSize] = useState('1K');
+        const [isGenerating, setIsGenerating] = useState(false);
+        const [error, setError] = useState(null);
+
+        if (!isOpen) return null;
+
+        const handleGenerate = async () => {
+          if (!prompt.trim()) return;
+          setIsGenerating(true);
+          setError(null);
+
+          try {
+            const url = await generateGameBackground(prompt, size);
+            if (url) {
+              onBackgroundGenerated(url);
+              onClose();
+            } else {
+              setError("Could not generate image. Try a different prompt.");
+            }
+          } catch (err) {
+            setError("API Error: Failed to generate image.");
+          } finally {
+            setIsGenerating(false);
+          }
+        };
+
+        return (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-md p-6 shadow-2xl relative">
+              <button 
+                  onClick={onClose}
+                  className="absolute top-4 right-4 text-gray-400 hover:text-white"
+              >
+                  ✕
+              </button>
+
+              <h2 className="text-2xl font-bold text-white mb-2">New Scene</h2>
+              <p className="text-gray-400 text-sm mb-6">Describe where you want to toss paper. We use <strong>Nano Banana Pro</strong> to create it.</p>
+
+              <div className="space-y-4">
+                  <div>
+                      <label className="block text-gray-300 text-sm font-medium mb-1">Prompt</label>
+                      <textarea 
+                          className="w-full bg-gray-950 border border-gray-700 rounded-lg p-3 text-white focus:border-blue-500 focus:outline-none"
+                          rows={3}
+                          placeholder="e.g., A futuristic cyberpunk office with neon lights..."
+                          value={prompt}
+                          onChange={(e) => setPrompt(e.target.value)}
+                      />
+                  </div>
+
+                  <div>
+                      <label className="block text-gray-300 text-sm font-medium mb-1">Resolution</label>
+                      <div className="flex bg-gray-950 rounded-lg p-1 border border-gray-700">
+                          {['1K', '2K', '4K'].map((s) => (
+                              <button
+                                  key={s}
+                                  onClick={() => setSize(s)}
+                                  className={`flex-1 py-2 rounded-md text-sm font-medium transition-colors ${
+                                      size === s ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-gray-200'
+                                  }`}
+                              >
+                                  {s}
+                              </button>
+                          ))}
+                      </div>
+                  </div>
+                  
+                  {error && <p className="text-red-400 text-sm">{error}</p>}
+
+                  <button
+                      onClick={handleGenerate}
+                      disabled={isGenerating || !prompt.trim()}
+                      className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-bold py-3 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+                  >
+                      {isGenerating ? (
+                          <>
+                              <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                              </svg>
+                              Generating Scene...
+                          </>
+                      ) : (
+                          "Create Scene"
+                      )}
+                  </button>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      // 4. App Root
+      const App = () => {
+        const [score, setScore] = useState(0);
+        const [wind, setWind] = useState({ speed: 0, label: 'Calm' });
+        const [isChatOpen, setIsChatOpen] = useState(false);
+        const [isBgGenOpen, setIsBgGenOpen] = useState(false);
+        const [backgroundUrl, setBackgroundUrl] = useState(null);
+
+        useEffect(() => {
+          const updateWind = () => {
+            const speed = (Math.random() * 10) - 5;
+            setWind({
+              speed,
+              label: Math.abs(speed) < 1 ? 'Calm' : Math.abs(speed) < 3 ? 'Breezy' : 'Windy'
+            });
+          };
+          
+          updateWind();
+          const interval = setInterval(updateWind, 5000);
+          return () => clearInterval(interval);
+        }, []);
+
+        return (
+          <div className="relative w-screen h-screen overflow-hidden bg-zinc-900 font-sans">
+            <GameCanvas 
+              wind={wind} 
+              onScoreUpdate={setScore} 
+              backgroundUrl={backgroundUrl} 
+            />
+
+            <div className="absolute top-4 right-4 flex flex-col gap-4">
+               <div className="flex gap-2">
+                  <button 
+                    onClick={() => setIsBgGenOpen(true)}
+                    className="bg-white/10 backdrop-blur-md border border-white/20 p-3 rounded-full text-white hover:bg-white/20 transition-all group relative"
+                    title="Change Scene"
+                  >
+                     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                       <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                       <circle cx="8.5" cy="8.5" r="1.5"/>
+                       <polyline points="21 15 16 10 5 21"/>
+                     </svg>
+                     <span className="absolute right-full mr-2 top-1/2 -translate-y-1/2 bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 whitespace-nowrap">Change Scene</span>
+                  </button>
+
+                  <button 
+                    onClick={() => setIsChatOpen(!isChatOpen)}
+                    className="bg-white/10 backdrop-blur-md border border-white/20 p-3 rounded-full text-white hover:bg-white/20 transition-all group relative"
+                    title="Chat Assistant"
+                  >
+                     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                       <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                     </svg>
+                     <span className="absolute right-full mr-2 top-1/2 -translate-y-1/2 bg-black text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 whitespace-nowrap">AI Chat</span>
+                  </button>
+               </div>
+            </div>
+
+            <BackgroundGenerator 
+              isOpen={isBgGenOpen} 
+              onClose={() => setIsBgGenOpen(false)} 
+              onBackgroundGenerated={setBackgroundUrl}
+            />
+
+            <ChatInterface 
+              isOpen={isChatOpen} 
+              onClose={() => setIsChatOpen(false)} 
+            />
+          </div>
+        );
+      };
+
+      const root = createRoot(document.getElementById('root'));
+      root.render(<App />);
+    </script>
   </body>
 </html>
